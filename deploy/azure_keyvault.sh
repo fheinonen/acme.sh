@@ -2,7 +2,7 @@
 
 # Deploy ACME artifacts to Azure Key Vault using either PEM secrets or a PFX import.
 #
-# Required environment variables:
+# Required environment variables (client credentials flow):
 #
 # AZURE_TENANT_ID            Azure AD tenant ID used for token acquisition
 # AZURE_CLIENT_ID            Application (client) ID used for token acquisition
@@ -15,8 +15,10 @@
 # AZURE_KEYVAULT_FORMAT      "pem" (default) or "pfx"
 # AZURE_KEYVAULT_PFX_FILE    Pre-built PFX bundle to upload when AZURE_KEYVAULT_FORMAT=pfx
 # AZURE_KEYVAULT_PFX_PASSWORD Password used to protect the PFX bundle (defaults to empty)
-# AZURE_SAVE_TOKEN           Persist the bearer token for re-use when set to any value
-#
+# AZURE_MANAGED_IDENTITY     Set to "system" or "user" to use a managed identity instead of client credentials
+# AZURE_MANAGED_IDENTITY_CLIENT_ID Client ID of a user-assigned managed identity (when AZURE_MANAGED_IDENTITY=user)
+# AZURE_MANAGED_IDENTITY_RESOURCE_ID Resource ID of a user-assigned managed identity (alternative to client ID)
+#                              When AZURE_MANAGED_IDENTITY is used the tenant/client/secret values are not required
 # Returns 0 on success, 1 otherwise.
 
 ######## Public functions #####################
@@ -37,6 +39,8 @@ azure_keyvault_deploy() {
   _debug _cfullchain "$_cfullchain_file"
   _debug DOMAIN_CONF "$DOMAIN_CONF"
 
+  __AKV_MI_MODE=""
+
   _getdeployconf AZURE_KEYVAULT_NAME
   if [ -z "$AZURE_KEYVAULT_NAME" ]; then
     _err "AZURE_KEYVAULT_NAME needs to be defined"
@@ -44,25 +48,75 @@ azure_keyvault_deploy() {
   fi
   _savedeployconf AZURE_KEYVAULT_NAME "$AZURE_KEYVAULT_NAME"
 
+  _getdeployconf AZURE_MANAGED_IDENTITY
+  _getdeployconf AZURE_MANAGED_IDENTITY_CLIENT_ID
+  _getdeployconf AZURE_MANAGED_IDENTITY_RESOURCE_ID
+
+  _mi_value=$(printf "%s" "$AZURE_MANAGED_IDENTITY" | tr '[:upper:]' '[:lower:]')
+  case "$_mi_value" in
+  ""|false|no|0|off)
+    AZURE_MANAGED_IDENTITY=""
+    ;;
+  user|user-assigned)
+    __AKV_MI_MODE="user"
+    AZURE_MANAGED_IDENTITY="user"
+    ;;
+  system|system-assigned)
+    __AKV_MI_MODE="system"
+    AZURE_MANAGED_IDENTITY="system"
+    ;;
+  *)
+    if [ -n "$_mi_value" ]; then
+      _err "AZURE_MANAGED_IDENTITY must be either 'system' or 'user'"
+      return 1
+    fi
+    ;;
+  esac
+
   _getdeployconf AZURE_TENANT_ID
-  if [ -z "$AZURE_TENANT_ID" ]; then
-    _err "AZURE_TENANT_ID needs to be defined"
-    return 1
-  fi
-  _savedeployconf AZURE_TENANT_ID "$AZURE_TENANT_ID"
-
   _getdeployconf AZURE_CLIENT_ID
-  if [ -z "$AZURE_CLIENT_ID" ]; then
-    _err "AZURE_CLIENT_ID needs to be defined"
-    return 1
-  fi
-  _savedeployconf AZURE_CLIENT_ID "$AZURE_CLIENT_ID"
-
   _getdeployconf AZURE_CLIENT_SECRET
-  if [ -z "$AZURE_CLIENT_SECRET" ]; then
-    _err "AZURE_CLIENT_SECRET needs to be defined"
-    return 1
+
+  if [ "$__AKV_MI_MODE" = "user" ]; then
+    if [ -z "$AZURE_MANAGED_IDENTITY_CLIENT_ID" ] && [ -z "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" ]; then
+      _err "AZURE_MANAGED_IDENTITY=user requires AZURE_MANAGED_IDENTITY_CLIENT_ID or AZURE_MANAGED_IDENTITY_RESOURCE_ID"
+      return 1
+    fi
   fi
+
+  if [ -z "$__AKV_MI_MODE" ]; then
+    if [ -z "$AZURE_TENANT_ID" ]; then
+      _err "AZURE_TENANT_ID needs to be defined"
+      return 1
+    fi
+    _savedeployconf AZURE_TENANT_ID "$AZURE_TENANT_ID"
+
+    if [ -z "$AZURE_CLIENT_ID" ]; then
+      _err "AZURE_CLIENT_ID needs to be defined"
+      return 1
+    fi
+    _savedeployconf AZURE_CLIENT_ID "$AZURE_CLIENT_ID"
+
+    if [ -z "$AZURE_CLIENT_SECRET" ]; then
+      _err "AZURE_CLIENT_SECRET needs to be defined"
+      return 1
+    fi
+    _savedeployconf AZURE_CLIENT_SECRET "$AZURE_CLIENT_SECRET"
+  else
+    _info "Using Azure managed identity ($__AKV_MI_MODE)"
+    _debug AZURE_MANAGED_IDENTITY "$AZURE_MANAGED_IDENTITY"
+    _debug AZURE_MANAGED_IDENTITY_CLIENT_ID "$AZURE_MANAGED_IDENTITY_CLIENT_ID"
+    _debug AZURE_MANAGED_IDENTITY_RESOURCE_ID "$AZURE_MANAGED_IDENTITY_RESOURCE_ID"
+    if [ -n "$AZURE_CLIENT_SECRET" ]; then
+      _debug "discarding_client_secret" "managed identity in use"
+    fi
+    AZURE_CLIENT_SECRET=""
+    _savedeployconf AZURE_CLIENT_SECRET ""
+  fi
+
+  _savedeployconf AZURE_MANAGED_IDENTITY "$AZURE_MANAGED_IDENTITY"
+  _savedeployconf AZURE_MANAGED_IDENTITY_CLIENT_ID "$AZURE_MANAGED_IDENTITY_CLIENT_ID"
+  _savedeployconf AZURE_MANAGED_IDENTITY_RESOURCE_ID "$AZURE_MANAGED_IDENTITY_RESOURCE_ID"
 
   _getdeployconf AZURE_KEYVAULT_CERT_NAME
   if [ -z "$AZURE_KEYVAULT_CERT_NAME" ]; then
@@ -92,19 +146,9 @@ azure_keyvault_deploy() {
   _getdeployconf AZURE_KEYVAULT_KEY_CURVE
   _savedeployconf AZURE_KEYVAULT_KEY_CURVE "$AZURE_KEYVAULT_KEY_CURVE"
 
-  _getdeployconf AZURE_SAVE_TOKEN
-  _savedeployconf AZURE_SAVE_TOKEN "$AZURE_SAVE_TOKEN"
-
-  _getdeployconf AZURE_ACCESS_TOKEN
-
   KV_BASE_URL="https://${AZURE_KEYVAULT_NAME}.vault.azure.net"
 
-  if [ -z "$AZURE_ACCESS_TOKEN" ]; then
-    AZURE_ACCESS_TOKEN=$(_azure_keyvault_obtain_token) || return 1
-    if [ -n "$AZURE_SAVE_TOKEN" ]; then
-      _savedeployconf AZURE_ACCESS_TOKEN "$AZURE_ACCESS_TOKEN"
-    fi
-  fi
+  AZURE_ACCESS_TOKEN=$(_azure_keyvault_obtain_token) || return 1
 
   export _H1="Authorization: Bearer $AZURE_ACCESS_TOKEN"
 
@@ -217,7 +261,91 @@ _azure_keyvault_normalize_name() {
   printf "%s" "$_akn_norm"
 }
 
+_azure_keyvault_obtain_msi_token() {
+  _resource="https://vault.azure.net"
+  _encoded_resource=$(printf "%s" "$_resource" | _url_encode)
+  _url=""
+
+  export _H1=""
+  export _H2=""
+
+  if [ -n "$IDENTITY_ENDPOINT" ]; then
+    if [ -z "$IDENTITY_HEADER" ]; then
+      _err "IDENTITY_ENDPOINT is set but IDENTITY_HEADER is missing"
+      return 1
+    fi
+    _url="${IDENTITY_ENDPOINT}?api-version=2019-08-01&resource=${_encoded_resource}"
+    if [ "$__AKV_MI_MODE" = "user" ]; then
+      if [ -n "$AZURE_MANAGED_IDENTITY_CLIENT_ID" ]; then
+        _url="${_url}&client_id=$(printf "%s" "$AZURE_MANAGED_IDENTITY_CLIENT_ID" | _url_encode)"
+      elif [ -n "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" ]; then
+        _url="${_url}&mi_res_id=$(printf "%s" "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" | _url_encode)"
+      fi
+    fi
+    export _H1="X-IDENTITY-HEADER: $IDENTITY_HEADER"
+    export _H2="Metadata: true"
+    _debug "managed_identity_endpoint" "IDENTITY_ENDPOINT"
+  elif [ -n "$MSI_ENDPOINT" ]; then
+    if [ -z "$MSI_SECRET" ]; then
+      _err "MSI_ENDPOINT is set but MSI_SECRET is missing"
+      return 1
+    fi
+    _url="${MSI_ENDPOINT}?resource=${_encoded_resource}&api-version=2017-09-01"
+    if [ "$__AKV_MI_MODE" = "user" ]; then
+      if [ -n "$AZURE_MANAGED_IDENTITY_CLIENT_ID" ]; then
+        _url="${_url}&clientid=$(printf "%s" "$AZURE_MANAGED_IDENTITY_CLIENT_ID" | _url_encode)"
+      elif [ -n "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" ]; then 
+        _url="${_url}&mi_res_id=$(printf "%s" "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" | _url_encode)"
+      fi
+    fi
+    export _H1="secret: $MSI_SECRET"
+    export _H2="Metadata: true"
+    _debug "managed_identity_endpoint" "MSI_ENDPOINT"
+  else
+    _url="http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=${_encoded_resource}"
+    if [ "$__AKV_MI_MODE" = "user" ]; then
+      if [ -n "$AZURE_MANAGED_IDENTITY_CLIENT_ID" ]; then
+        _url="${_url}&client_id=$(printf "%s" "$AZURE_MANAGED_IDENTITY_CLIENT_ID" | _url_encode)"
+      elif [ -n "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" ]; then
+        _url="${_url}&mi_res_id=$(printf "%s" "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" | _url_encode)"
+      fi
+    fi
+    export _H1="Metadata: true"
+    _debug "managed_identity_endpoint" "IMDS"
+  fi
+
+  _debug "managed_identity_request_url" "$_url"
+
+  _response=$(_get "$_url")
+  _ret="$?"
+  export _H1=""
+  export _H2=""
+  if [ "$_ret" != "0" ]; then
+    _err "Failed to request managed identity token"
+    return 1
+  fi
+
+  _azure_access_token=$(printf "%s" "$_response" | sed -n 's/.*"access_token":"\([^"\\]*\)".*/\1/p')
+  if [ -z "$_azure_access_token" ]; then
+    _err "Managed identity response did not contain an access_token"
+    _debug2 "managed_identity_response" "$_response"
+    return 1
+  fi
+
+  printf "%s" "$_azure_access_token"
+  return 0
+}
+
 _azure_keyvault_obtain_token() {
+  if [ -n "$__AKV_MI_MODE" ]; then
+    _azure_msi_token=$(_azure_keyvault_obtain_msi_token)
+    if [ "$?" != "0" ] || [ -z "$_azure_msi_token" ]; then
+      return 1
+    fi
+    printf "%s" "$_azure_msi_token"
+    return 0
+  fi
+
   _token_url="https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token"
   _encoded_client_id=$(printf "%s" "$AZURE_CLIENT_ID" | _url_encode)
   _encoded_client_secret=$(printf "%s" "$AZURE_CLIENT_SECRET" | _url_encode)
@@ -268,9 +396,6 @@ _azure_keyvault_api_call() {
     if [ "$_attempt" != "retry" ]; then
       _info "Azure token expired, requesting a new token"
       AZURE_ACCESS_TOKEN=$(_azure_keyvault_obtain_token) || return 1
-      if [ -n "$AZURE_SAVE_TOKEN" ]; then
-        _savedeployconf AZURE_ACCESS_TOKEN "$AZURE_ACCESS_TOKEN"
-      fi
       export _H1="Authorization: Bearer $AZURE_ACCESS_TOKEN"
       _response=$(_azure_keyvault_api_call "$_body" "$_url" "$_method" "$_content_type" "retry")
       _ret="$?"
