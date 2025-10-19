@@ -54,14 +54,14 @@ azure_keyvault_deploy() {
 
   _mi_value=$(printf "%s" "$AZURE_MANAGED_IDENTITY" | tr '[:upper:]' '[:lower:]')
   case "$_mi_value" in
-  ""|false|no|0|off)
+  "" | false | no | 0 | off)
     AZURE_MANAGED_IDENTITY=""
     ;;
-  user|user-assigned)
+  user | user-assigned)
     __AKV_MI_MODE="user"
     AZURE_MANAGED_IDENTITY="user"
     ;;
-  system|system-assigned)
+  system | system-assigned)
     __AKV_MI_MODE="system"
     AZURE_MANAGED_IDENTITY="system"
     ;;
@@ -157,86 +157,7 @@ azure_keyvault_deploy() {
       return 1
     fi
   else
-    _getdeployconf AZURE_KEYVAULT_PFX_FILE
-    _savedeployconf AZURE_KEYVAULT_PFX_FILE "$AZURE_KEYVAULT_PFX_FILE"
-    _getdeployconf AZURE_KEYVAULT_PFX_PASSWORD
-
-    _pfx_key_type="$AZURE_KEYVAULT_KEY_TYPE"
-    _pfx_key_curve="$AZURE_KEYVAULT_KEY_CURVE"
-    _detected_bits=""
-    _detected_type=""
-    _detected_curve=""
-    if command -v openssl >/dev/null 2>&1; then
-      _detected_bits=$(_azure_keyvault_detect_key_size "$_ccert_file")
-      if [ -n "$_detected_bits" ]; then
-        _debug "pfx_detected_key_bits" "$_detected_bits"
-      fi
-      _algo_line=$(openssl x509 -in "$_ccert_file" -noout -text 2>/dev/null | grep -m1 'Public Key Algorithm:')
-      case "$_algo_line" in
-      *RSA*) _detected_type="RSA" ;;
-      *EC* | *id-ecPublicKey*) _detected_type="EC" ;;
-      esac
-    fi
-    if [ -n "$_detected_type" ]; then
-      _debug "pfx_detected_key_type" "$_detected_type"
-    fi
-    _pfx_key_bits="$_detected_bits"
-    if [ -z "$_pfx_key_type" ] && [ -n "$_detected_type" ]; then
-      _pfx_key_type="$_detected_type"
-    fi
-    case "$_pfx_key_type" in
-    EC | EC-HSM)
-      if [ -z "$_pfx_key_curve" ]; then
-        if [ -z "$_detected_curve" ] && command -v openssl >/dev/null 2>&1; then
-          _detected_curve=$(_azure_keyvault_detect_curve "$_ccert_file")
-        fi
-        if [ -n "$_detected_curve" ]; then
-          _pfx_key_curve="$_detected_curve"
-        fi
-      fi
-      ;;
-    esac
-    if [ -n "$_detected_curve" ]; then
-      _debug "pfx_detected_key_curve" "$_detected_curve"
-    fi
-
-    if [ -n "$AZURE_KEYVAULT_PFX_FILE" ]; then
-      if [ ! -f "$AZURE_KEYVAULT_PFX_FILE" ]; then
-        _err "Provided AZURE_KEYVAULT_PFX_FILE '$AZURE_KEYVAULT_PFX_FILE' does not exist"
-        return 1
-      fi
-      _pfx_path="$AZURE_KEYVAULT_PFX_FILE"
-    else
-      if ! command -v openssl >/dev/null 2>&1; then
-        _err "openssl is required to generate a PFX bundle"
-        return 1
-      fi
-      _pfx_path=$(mktemp /tmp/akv_certXXXXXX.pfx)
-      _info "Building temporary PFX bundle for Azure Key Vault"
-      _chain_file="$_ccert_file"
-      if [ -s "$_cfullchain_file" ]; then
-        _chain_file="$_cfullchain_file"
-      fi
-      if [ -s "$_cca_file" ]; then
-        set -- -certfile "$_cca_file"
-      else
-        set --
-      fi
-      if ! openssl pkcs12 -export -out "$_pfx_path" -inkey "$_ckey_file" -in "$_chain_file" "$@" -passout "pass:${AZURE_KEYVAULT_PFX_PASSWORD:-}" >/dev/null 2>&1; then
-        _err "openssl pkcs12 export failed"
-        rm -f "$_pfx_path"
-        set --
-        return 1
-      fi
-      set --
-    fi
-
-    _pfx_payload=$(cat "$_pfx_path" | base64 | tr -d '\n')
-    if [ -z "$AZURE_KEYVAULT_PFX_FILE" ]; then
-      rm -f "$_pfx_path"
-    fi
-
-    if ! _azure_keyvault_import_certificate "pfx" "$_pfx_payload" "${AZURE_KEYVAULT_PFX_PASSWORD:-}" "$_pfx_key_type" "$_pfx_key_bits" "$_pfx_key_curve"; then
+    if ! _azure_keyvault_import_pfx_certificate "$_ckey_file" "$_ccert_file" "$_cca_file" "$_cfullchain_file"; then
       return 1
     fi
   fi
@@ -294,7 +215,7 @@ _azure_keyvault_obtain_msi_token() {
     if [ "$__AKV_MI_MODE" = "user" ]; then
       if [ -n "$AZURE_MANAGED_IDENTITY_CLIENT_ID" ]; then
         _url="${_url}&clientid=$(printf "%s" "$AZURE_MANAGED_IDENTITY_CLIENT_ID" | _url_encode)"
-      elif [ -n "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" ]; then 
+      elif [ -n "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" ]; then
         _url="${_url}&mi_res_id=$(printf "%s" "$AZURE_MANAGED_IDENTITY_RESOURCE_ID" | _url_encode)"
       fi
     fi
@@ -629,5 +550,103 @@ _azure_keyvault_import_pem_certificate() {
   if ! _azure_keyvault_import_certificate "pem" "$_pem_payload" "" "$_key_type" "$_key_bits" "$_key_curve"; then
     return 1
   fi
+  return 0
+}
+
+_azure_keyvault_import_pfx_certificate() {
+  _key_file="$1"
+  _cert_file="$2"
+  _ca_file="$3"
+  _fullchain_file="$4"
+
+  _getdeployconf AZURE_KEYVAULT_PFX_FILE
+  _savedeployconf AZURE_KEYVAULT_PFX_FILE "$AZURE_KEYVAULT_PFX_FILE"
+  _getdeployconf AZURE_KEYVAULT_PFX_PASSWORD
+
+  _pfx_key_type="$AZURE_KEYVAULT_KEY_TYPE"
+  _pfx_key_curve="$AZURE_KEYVAULT_KEY_CURVE"
+  _detected_bits=""
+  _detected_type=""
+  _detected_curve=""
+
+  if command -v openssl >/dev/null 2>&1; then
+    _detected_bits=$(_azure_keyvault_detect_key_size "$_cert_file")
+    if [ -n "$_detected_bits" ]; then
+      _debug "pfx_detected_key_bits" "$_detected_bits"
+    fi
+    _algo_line=$(openssl x509 -in "$_cert_file" -noout -text 2>/dev/null | grep -m1 'Public Key Algorithm:')
+    case "$_algo_line" in
+    *RSA*) _detected_type="RSA" ;;
+    *EC* | *id-ecPublicKey*) _detected_type="EC" ;;
+    esac
+  fi
+
+  if [ -n "$_detected_type" ]; then
+    _debug "pfx_detected_key_type" "$_detected_type"
+  fi
+
+  _pfx_key_bits="$_detected_bits"
+  if [ -z "$_pfx_key_type" ] && [ -n "$_detected_type" ]; then
+    _pfx_key_type="$_detected_type"
+  fi
+
+  case "$_pfx_key_type" in
+  EC | EC-HSM)
+    if [ -z "$_pfx_key_curve" ]; then
+      if [ -z "$_detected_curve" ] && command -v openssl >/dev/null 2>&1; then
+        _detected_curve=$(_azure_keyvault_detect_curve "$_cert_file")
+      fi
+      if [ -n "$_detected_curve" ]; then
+        _pfx_key_curve="$_detected_curve"
+      fi
+    fi
+    ;;
+  esac
+
+  if [ -n "$_detected_curve" ]; then
+    _debug "pfx_detected_key_curve" "$_detected_curve"
+  fi
+
+  if [ -n "$AZURE_KEYVAULT_PFX_FILE" ]; then
+    if [ ! -f "$AZURE_KEYVAULT_PFX_FILE" ]; then
+      _err "Provided AZURE_KEYVAULT_PFX_FILE '$AZURE_KEYVAULT_PFX_FILE' does not exist"
+      return 1
+    fi
+    _pfx_path="$AZURE_KEYVAULT_PFX_FILE"
+  else
+    if ! command -v openssl >/dev/null 2>&1; then
+      _err "openssl is required to generate a PFX bundle"
+      return 1
+    fi
+    _pfx_path=$(mktemp /tmp/akv_certXXXXXX.pfx)
+    _info "Building temporary PFX bundle for Azure Key Vault"
+    _chain_file="$_cert_file"
+    if [ -s "$_fullchain_file" ]; then
+      _chain_file="$_fullchain_file"
+    fi
+    if [ -s "$_ca_file" ]; then
+      if ! openssl pkcs12 -export -out "$_pfx_path" -inkey "$_key_file" -in "$_chain_file" -certfile "$_ca_file" -passout "pass:${AZURE_KEYVAULT_PFX_PASSWORD:-}" >/dev/null 2>&1; then
+        _err "openssl pkcs12 export failed"
+        rm -f "$_pfx_path"
+        return 1
+      fi
+    else
+      if ! openssl pkcs12 -export -out "$_pfx_path" -inkey "$_key_file" -in "$_chain_file" -passout "pass:${AZURE_KEYVAULT_PFX_PASSWORD:-}" >/dev/null 2>&1; then
+        _err "openssl pkcs12 export failed"
+        rm -f "$_pfx_path"
+        return 1
+      fi
+    fi
+  fi
+
+  _pfx_payload=$(cat "$_pfx_path" | base64 | tr -d '\n')
+  if [ -z "$AZURE_KEYVAULT_PFX_FILE" ]; then
+    rm -f "$_pfx_path"
+  fi
+
+  if ! _azure_keyvault_import_certificate "pfx" "$_pfx_payload" "${AZURE_KEYVAULT_PFX_PASSWORD:-}" "$_pfx_key_type" "$_pfx_key_bits" "$_pfx_key_curve"; then
+    return 1
+  fi
+
   return 0
 }
